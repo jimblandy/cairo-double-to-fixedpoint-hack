@@ -1,0 +1,592 @@
+╭─── Claude Code v2.1.220 ─────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting        │
+│                  Welcome back Jim!                 │ started                 │
+│                                                    │ Run /init to create a … │
+│                       ▐▛███▜▌                      │ ─────────────────────── │
+│                      ▝▜█████▛▘                     │ What's new              │
+│                        ▘▘ ▝▝                       │ Bug fixes and reliabil… │
+│                                                    │ Added Claude Opus 5 (`… │
+│   Sonnet 5 · API Usage Billing · Mozilla Security  │ Added `sandbox.network… │
+│             ~/claude/cairo-magic-number            │ /release-notes for more │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ Hey there, Claude. In this directory, `cairo-excerpt.c` contains some         
+  fragments of code I copied out of the Cairo vector graphics library source.   
+  It explains a clever technique for converting `double` values to a 32-bit,    
+  16-bit-fraction fixed-point format, called `cairo_fixed_16_16_t`. The comment 
+  claims that this provides "a very large speedup on a wide array of systems".  
+  I assume this speedup is relative to simply multiplying by 65536 and using    
+  the usual conversion to `int32_t`. I'm sure that was true when the code was   
+  originally written, but I'm doubtful that it's still true now. Could you      
+  write some benchmarks to compare the two approaches? Only consider the range  
+  of doubles where Cairo's trick works; I'm satisfied that it's correct         
+  (enough), I'm just curious whether it really is still faster on modern        
+  hardware.                                                                     
+
+  Read 1 file (ctrl+o to expand)
+
+● I'll look at the magic-number trick's valid input range, then write a
+  self-contained C benchmark comparing it against the naive multiply-and-cast
+  approach — including both a throughput variant (compiler is free to
+  vectorize/pipeline, as it would for the static inline functions in real Cairo
+  code) and a latency variant (serial dependency chain, which exposes the
+  store-forwarding stall the union trick incurs on modern out-of-order CPUs).
+
+  Searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● Write(bench.c)
+  ⎿  Wrote 169 lines to bench.c
+       1 /*
+          trick
+       3  * vs. the straightforward "multiply by 65536 and cast" approach
+       4  *
+       5  * Only doubles in the range representable by a signed 16.16 fix
+       6  * value are used ([-32768.0, 32767.0]), since that's the domain
+          where
+         es this.
+       8  *
+      10  *
+     … +181 lines (ctrl+o to expand)
+
+● Now let me compile and run at a few optimization levels, since the result may
+  hinge on whether the compiler can vectorize/inline.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The overhead numbers are suspiciously close to indirect-call overhead rather
+  than the true cost of each conversion. Let me check whether GCC actually
+  inlined/vectorized through the function pointer, or if we're just measuring
+  call rax overhead.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Good catch on my part needed — the loop is calling through a function pointer
+  (call *%r12), so we're mostly measuring indirect-call overhead, not the true
+  cost of either conversion (and definitely not what happens in real Cairo code,
+  where the static inline function gets inlined directly at the call site). Let
+  me fix the benchmark to call each approach directly so the compiler can
+  inline/vectorize it the way it actually would in production code.
+
+● Update(bench.c)
+  ⎿  Added 22 lines, removed 5 lines
+       90  static double inputs[N_ELEMS];
+       91  static int32_t outputs[N_ELEMS];
+       92  
+       93 -typedef cairo_fixed_16_16_t (*convert_fn)(double);            
+       93 +/* Each approach gets its own convert-the-whole-array function
+          +, called                                                      
+       94 + * directly (never through a function pointer), so the compile
+          +r can                                                         
+       95 + * inline and auto-vectorize exactly as it would for a real ca
+          +ll site                                                       
+       96 + * to one of these `static inline` conversion functions. */   
+       97  
+       95 -static double bench_throughput(convert_fn fn, const char *name
+          -)                                                             
+       98 +__attribute__((noinline)) static void                         
+       99 +convert_array_magic(const double *in, int32_t *out, int n)    
+      100  {
+      101 +    for (int i = 0; i < n; i++)                               
+      102 +        out[i] = magic_fixed_16_16_from_double(in[i]);        
+      103 +}                                                             
+      104 +                                                              
+      105 +__attribute__((noinline)) static void                         
+      106 +convert_array_naive(const double *in, int32_t *out, int n)    
+      107 +{                                                             
+      108 +    for (int i = 0; i < n; i++)                               
+      109 +        out[i] = naive_fixed_16_16_from_double(in[i]);        
+      110 +}                                                             
+      111 +                                                              
+      112 +typedef void (*convert_array_fn)(const double *, int32_t *, in
+          +t);                                                           
+      113 +                                                              
+      114 +static double bench_throughput(convert_array_fn fn, const char
+          + *name)                                                       
+      115 +{                                                             
+      116      double best = 1e300;
+      117  
+      118      for (int rep = 0; rep < N_REPEATS; rep++) {
+      119          double t0 = now_sec();
+      101 -        for (int i = 0; i < N_ELEMS; i++) {                   
+      102 -            outputs[i] = fn(inputs[i]);                       
+      103 -        }                                                     
+      120 +        fn(inputs, outputs, N_ELEMS);                         
+      121          double t1 = now_sec();
+      122          if (t1 - t0 < best)
+      123              best = t1 - t0;
+
+● Update(bench.c)
+  ⎿  Added 31 lines, removed 11 lines
+      142  
+      143  #define N_CHAIN (1 << 24) /* 16M serially-dependent conversion
+           s */
+      144  
+      145 -static double bench_latency(convert_fn fn, const char *name)  
+      145 +__attribute__((noinline)) static double                       
+      146 +chain_magic(double acc, int n)                                
+      147  {
+      148 +    for (int i = 0; i < n; i++) {                             
+      149 +        int32_t v = magic_fixed_16_16_from_double(acc);       
+      150 +        /* Fold the integer result back into a small double so
+          + the                                                          
+      151 +         * next iteration's input truly depends on this one's 
+          +output,                                                       
+      152 +         * while staying within [-32768, 32767]. */           
+      153 +        acc = (double)(int16_t)(v ^ i);                       
+      154 +    }                                                         
+      155 +    return acc;                                               
+      156 +}                                                             
+      157 +                                                              
+      158 +__attribute__((noinline)) static double                       
+      159 +chain_naive(double acc, int n)                                
+      160 +{                                                             
+      161 +    for (int i = 0; i < n; i++) {                             
+      162 +        int32_t v = naive_fixed_16_16_from_double(acc);       
+      163 +        acc = (double)(int16_t)(v ^ i);                       
+      164 +    }                                                         
+      165 +    return acc;                                               
+      166 +}                                                             
+      167 +                                                              
+      168 +typedef double (*chain_fn)(double, int);                      
+      169 +                                                              
+      170 +static double bench_latency(chain_fn fn, const char *name)    
+      171 +{                                                             
+      172      double best = 1e300;
+      173 +    double result = 0;                                        
+      174  
+      175      for (int rep = 0; rep < 5; rep++) {
+      150 -        double acc = 0.5; /* arbitrary seed in-range */       
+      176          double t0 = now_sec();
+      152 -        for (int i = 0; i < N_CHAIN; i++) {                   
+      153 -            int32_t v = fn(acc);                              
+      154 -            /* Fold the integer result back into a small doubl
+          -e so the                                                      
+      155 -             * next iteration's input truly depends on this on
+          -e's                                                           
+      156 -             * output, while staying within [-32768, 32767]. *
+          -/                                                             
+      157 -            acc = (double)(int16_t)(v ^ i);                   
+      158 -        }                                                     
+      177 +        result = fn(0.5 /* arbitrary seed in-range */, N_CHAIN
+          +);                                                            
+      178          double t1 = now_sec();
+      179          if (t1 - t0 < best)
+      180              best = t1 - t0;
+      162 -        __asm__ __volatile__("" : : "g"(&acc) : "memory");    
+      181 +        __asm__ __volatile__("" : : "g"(&result) : "memory"); 
+      182      }
+      183  
+      184      double ns_per_call = best * 1e9 / N_CHAIN;
+      166 -    printf("%-32s best=%8.3f ms  %6.3f ns/call\n", name, best 
+          -* 1e3, ns_per_call);                                          
+      185 +    printf("%-32s best=%8.3f ms  %6.3f ns/call  (result=%g)\n"
+          +, name, best * 1e3,                                           
+      186 +           ns_per_call, result);                              
+      187      return ns_per_call;
+      188  }
+      189  
+
+● Now update main to pass the new array-based function names:
+
+● Update(bench.c)
+  ⎿  Added 4 lines, removed 4 lines
+      193          inputs[i] = random_input();
+      194  
+      195      printf("=== Throughput (independent conversions, array of 
+           %d) ===\n", N_ELEMS);
+      196 -    double t_magic = bench_throughput(magic_fixed_16_16_from_d
+          -ouble, "magic number");                                       
+      197 -    double t_naive = bench_throughput(naive_fixed_16_16_from_d
+          -ouble, "naive multiply+cast");                                
+      196 +    double t_magic = bench_throughput(convert_array_magic, "ma
+          +gic number");                                                 
+      197 +    double t_naive = bench_throughput(convert_array_naive, "na
+          +ive multiply+cast");                                          
+      198      printf("magic/naive ratio: %.2fx\n\n", t_magic / t_naive);
+      199  
+      200      printf("=== Latency (serial dependency chain, %d conversio
+           ns) ===\n", N_CHAIN);
+      201 -    double l_magic = bench_latency(magic_fixed_16_16_from_doub
+          -le, "magic number");                                          
+      202 -    double l_naive = bench_latency(naive_fixed_16_16_from_doub
+          -le, "naive multiply+cast");                                   
+      201 +    double l_magic = bench_latency(chain_magic, "magic number"
+          +);                                                            
+      202 +    double l_naive = bench_latency(chain_naive, "naive multipl
+          +y+cast");                                                     
+      203      printf("magic/naive ratio: %.2fx\n", l_magic / l_naive);
+      204  
+      205      return 0;
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The results show a clear split — let me check the generated assembly to
+  confirm what's actually happening (vectorization pattern differs a lot between
+  the two).
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● That's the whole story right there: naive auto-vectorizes into 8-wide AVX-512
+  (vmulpd/vcvttpd2dq on zmm registers), while magic compiles to a scalar loop
+  the compiler can't vectorize (the union-based bit-reinterpretation blocks it).
+  Let me also check without -march=native, since most real builds don't get
+  AVX-512 by default.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● I wrote bench.c (self-contained, no dependencies) with two kinds of tests,
+  using random doubles confined to [-32768.0, 32767.0] — the range where both
+  techniques agree:
+
+  - Throughput: convert a 1M-element array, letting the compiler
+  inline/vectorize each approach exactly as it would for real static inline call
+  sites.
+  - Latency: a serial dependency chain (each result feeds the next input), which
+  isolates raw instruction latency from pipelining effects.
+
+  Tested at -O0/-O2/-O3 and across -march=native (AVX-512), x86-64-v2,
+  x86-64-v3, and the plain baseline. Results were consistent everywhere except
+  -O0. At any real optimization level:
+
+  ┌─────────────────────┬──────────────────────┬───────────────────┐
+  │                     │ throughput (ns/call) │ latency (ns/call) │
+  ├─────────────────────┼──────────────────────┼───────────────────┤
+  │ magic number        │ ~0.21                │ ~2.6–3.2          │
+  ├─────────────────────┼──────────────────────┼───────────────────┤
+  │ naive multiply+cast │ ~0.10                │ ~3.2              │
+  └─────────────────────┴──────────────────────┴───────────────────┘
+
+  Your hunch was right, for the common case. On independent conversions (the
+  realistic case — converting arrays of coordinates), naive is ~2x faster, on
+  every architecture level I tried, including plain SSE2. I checked the
+  disassembly to see why: naive auto-vectorizes into packed vmulpd/vcvttpd2dq (8
+  doubles at a time under AVX-512, still 2–4 at a time under SSE2/AVX), while
+  magic compiles to a scalar loop — the union-based bit-reinterpretation blocks
+  the compiler from vectorizing it at all.
+
+  The one place the old trick still wins is the latency-bound case: a single
+  addsd + movd (extracting the low 32 bits of the mantissa) has lower latency
+  than a single mulsd + cvttsd2si. So if you're doing one conversion buried in a
+  serial dependency chain with nothing else to overlap it with, magic-number is
+  marginally faster (~15-20%) — but that's a narrow, somewhat artificial
+  scenario compared to how Cairo actually uses this (converting many coordinates
+  while rasterizing).
+
+  So: the comment's claim was almost certainly true on 2003-era hardware without
+  SSE2's cvttsd2si/SIMD float-to-int conversions and without compilers that
+  auto-vectorize FP loops. On a modern compiler/CPU, the auto-vectorizer makes
+  the "obvious" approach faster for realistic (batch) workloads, and only
+  marginally slower in the worst case (isolated, serially-dependent
+  conversions).
+
+✻ Worked for 3m 0s
+
+❯ /export analysis.html                                                         
+  ⎿  Conversation exported to:
+     /home/jimb/claude/cairo-magic-number/analysis.html
+❯ Great! I'm curious about the latency story, though. Is it not the case that   
+  floating-point multiplies are single-cycle operations on modern processors?   
+  Shouldn't `cvttsd2si` also be pretty cheap? Why do you think there's more     
+  latency there than `addsd + movd`?                                            
+
+● Good question. Let me check the actual instructions generated for the latency
+  chain, and also isolate the forward-conversion step more precisely to confirm
+  the reasoning.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Let me get exact cycle counts with perf stat rather than inferring frequency
+  from wall-clock time.
+
+● Write(latency_isolate.c)
+  ⎿  Wrote 47 lines to latency_isolate.c
+       1 /* Isolate the per-iteration cost of the forward double->int32 s
+         tep in
+         cles`.
+       3  * Pick which chain to run via argv[1] ("magic" or "naive") so e
+         ach
+       5 
+       6 #include <stdint.h>
+       7 #include <stdio.h>
+       9 
+      10 #define CAIRO_MAGIC_NUMBER_FIXED_16_16 (103079215104.0)
+     … +39 lines (ctrl+o to expand)
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Good instinct to double check — let me verify precisely what's different
+  between the two loop bodies. I disassembled chain_naive and chain_magic and
+  they're identical except for one instruction pair in the loop-carried
+  dependency chain:
+
+  naive:  vmulsd %xmm1,%xmm0,%xmm0   →   vcvttsd2si %xmm0,%eax
+  magic:  vaddsd %xmm1,%xmm0,%xmm3   →   vmovq      %xmm3,%rax
+
+  Everything else in the loop (the xor, inc, cwtl, the vcvtsi2sd converting back
+  to double to continue the chain, loop control) is byte-for-byte identical
+  between the two functions. So the latency delta we measured (~2.6ns vs ~3.2ns
+  per iteration) is attributable entirely to that one pair of instructions.
+
+  To your two sub-questions:
+
+  "Aren't FP multiplies single-cycle?" No — that's conflating throughput with
+  latency. On essentially every modern x86 core, addsd/mulsd are fully pipelined
+  with high throughput (the FP unit can start a new one every cycle or every
+  half-cycle), but each individual instruction still takes a few cycles to
+  actually produce its result — commonly 3-4 cycles latency. You only get the
+  "1-per-cycle" behavior when consecutive multiplies are independent, so the CPU
+  can have several in flight at once. In a serial dependency chain — which is
+  exactly what my latency benchmark forces — that pipelining is invisible; each
+  iteration has to wait out the full latency of the previous one. That's the
+  whole reason the throughput and latency benchmarks told different stories:
+  naive wins on throughput (independent ops, pipeline/vectorize freely) but
+  loses on latency (forced serial chain).
+
+  "Shouldn't cvttsd2si also be cheap?" It's cheap in throughput terms (that's
+  why it vectorizes so well as vcvttpd2dq), but per-instruction it's doing real
+  work: decode the IEEE-754 sign/exponent/mantissa, shift according to the
+  exponent, truncate toward zero, and detect out-of-range/NaN inputs to produce
+  the "integer indefinite" result (0x80000000) per the x86 spec. That's a
+  genuine format conversion through dedicated FP→int conversion logic. vmovq 
+  %xmm,%rax, by contrast, does none of that — it's a raw copy of 64 bits from
+  the vector register file to the general-purpose register file, with zero
+  interpretation of what those bits mean numerically. Across x86
+  microarchitectures, "real" numeric conversions between FP and integer domains
+  have consistently carried a few cycles more latency than plain bit-transfer
+  instructions between the same register files, precisely because of that extra
+  decode/round/except-check logic.
+
+  I wanted to give you exact cycle counts via perf stat, but this sandbox has
+  perf_event_paranoid=4 (no perf access without root), so I can't pull hardware
+  performance-counter numbers directly. The wall-clock delta (~0.5ns/iteration,
+  roughly 2-3 cycles at this chip's boost clock) is consistent with the known
+  "conversion costs a couple more cycles than a bit-copy" pattern, but I can't
+  give you a citation-grade cycle-exact number for this specific Zen4 core
+  without that access.
+
+✻ Cogitated for 2m 55s
+
+※ recap: We benchmarked Cairo's magic-number double-to-fixed-point trick against a naive multiply-and-cast, finding naive wins on throughput (vectorizes) but magic wins on latency (cheaper instruction). Currently explaining why, via disassembly; no further action pending unless you want more digging. (disable recaps in /config)
+
+❯ I've lowered `perf_event_paranoid` to 2, is that good enough?                 
+
+● That should be enough for userspace-only counters. Let me try again.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● perf_event_paranoid=2 allows userspace counters, and it worked. Here are the
+  exact numbers, on N_CHAIN = 2^28 iterations of the isolated chain:
+
+  ┌────────────────┬────────────┬────────────┬───────────┬────────────────┐
+  │                │   cycles   │ instructio │ cycles/it │ instructions/i │
+  │                │            │     ns     │    er     │      ter       │
+  ├────────────────┼────────────┼────────────┼───────────┼────────────────┤
+  │ naive (mulsd+c │ 4,564,491, │ 2,147,607, │ 17.0      │ 8.00           │
+  │ vttsd2si)      │ 729        │ 355        │           │                │
+  ├────────────────┼────────────┼────────────┼───────────┼────────────────┤
+  │ magic          │ 3,758,942, │ 2,147,607, │ 14.0      │ 8.00           │
+  │ (addsd+vmovq)  │ 135        │ 101        │           │                │
+  └────────────────┴────────────┴────────────┴───────────┴────────────────┘
+
+  Both loop bodies execute exactly 8 instructions per iteration — matches the
+  disassembly, since the only difference is that one instruction pair.
+  Instruction count is identical, but the naive chain costs 3.0 more cycles per 
+  iteration, entirely attributable to cvttsd2si vs vmovq (since that's the only
+  instruction that differs, and everything is serially dependent so cycle count
+  tracks the critical-path latency).
+
+  That's now a hardware-verified number, not an estimate: on this Zen4 core, a
+  true FP→int32 numeric conversion (cvttsd2si) costs about 3 cycles more in
+  latency than a raw 64-bit bit-copy from the vector register file to a GPR
+  (vmovq) — consistent with the reasoning that cvttsd2si does real
+  decode/round/overflow-check work while vmovq just moves bits.
+
+✻ Sautéed for 29s
+
+❯ Okay. Can you use perf to get similar numbers for the original comparison?    
+
+● Write(orig_perf.c)
+  ⎿  Wrote 110 lines to orig_perf.c
+       1 /* perf-stat-friendly harness for the *original* throughput and 
+         latency
+         chain),
+       3  * run one at a time so `perf stat` cycle counts aren't shared b
+         etween
+       5 
+       6 #include <stdint.h>
+       7 #include <stdio.h>
+       9 
+      10 #define CAIRO_MAGIC_NUMBER_FIXED_16_16 (103079215104.0)
+     … +107 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● perf confirms both halves of the story with exact hardware counters.
+
+  Throughput (209,715,200 total conversions: 1M-element array × 200 passes):
+
+  ┌───────┬─────────────┬───────────────┬────────────────┬───────────────┐
+  │       │   cycles    │ instructions  │ cycles/element │ instr/element │
+  ├───────┼─────────────┼───────────────┼────────────────┼───────────────┤
+  │ naive │ 116,358,595 │ 151,712,838   │ 0.555          │ 0.72          │
+  ├───────┼─────────────┼───────────────┼────────────────┼───────────────┤
+  │ magic │ 222,527,296 │ 1,069,217,583 │ 1.061          │ 5.10          │
+  └───────┴─────────────┴───────────────┴────────────────┴───────────────┘
+
+  Magic costs 1.91x the cycles per element — and the instruction counts explain
+  exactly why: naive executes ~0.72 instructions per element (AVX-512 processing
+  8 doubles per vmulpd/vcvttpd2dq), while magic executes ~5.1 instructions per
+  element, matching the scalar loop body we saw in the disassembly (vaddsd,
+  vmovd, inc, cmp, jne = 5 instructions, one element at a time, no vectorization
+  at all).
+
+  Latency (16,777,216-iteration dependency chain):
+
+  ┌───────┬─────────────┬──────────────┬─────────────┐
+  │       │   cycles    │ instructions │ cycles/iter │
+  ├───────┼─────────────┼──────────────┼─────────────┤
+  │ naive │ 285,460,174 │ 134,340,574  │ 17.02       │
+  ├───────┼─────────────┼──────────────┼─────────────┤
+  │ magic │ 235,123,126 │ 134,340,553  │ 14.01       │
+  └───────┴─────────────┴──────────────┴─────────────┘
+
+  Same 8 instructions/iteration for both (matches the isolated microbenchmark
+  exactly), and the same 3.0-cycle gap as before — reproducing the cvttsd2si vs
+  vmovq latency delta cleanly.
+
+  So the hardware counters validate the wall-clock story precisely: naive wins
+  throughput ~1.9x via vectorization, magic wins latency by a fixed ~3 cycles
+  via cheaper bit-transfer vs. real FP→int conversion. Nothing in the earlier
+  conclusions changes — this just replaces the "should be roughly right"
+  wall-clock inference with exact, reproducible cycle counts.
+
+✻ Churned for 49s
+
+❯ But these results do seem to depend on vectorization. At least when it was    
+  originally introduced, using AVX-512 instructions incurred significant        
+  startup costs, I think because it took time to power up that part of the      
+  chip, or because the entire core needed to run at a lower clock frequency to  
+  avoid overheating. Is my memory correct? Do these sorts of incidental costs   
+  still apply on modern hardware? How does the benchmark perform if we limit it 
+  to use less demanding SIMD instructions?                                      
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● The measured window here (~30ms) is mostly dominated by fixed startup overhead
+  (array init, process launch), which makes any frequency estimate noisy. Let
+  me lengthen the run so the loop dominates, and make repeat count adjustable so
+  I can compare steady-state frequency directly.
+
+● Update(orig_perf.c)
+  ⎿  Removed 1 line
+      79  }
+      80  
+      81  #define N_ELEMS (1 << 20)
+      82 -#define N_TP_REPEATS 200 /* repeat the array pass many times, l
+         -ike bench.c's N_REPEATS loop */                                
+      82  #define N_CHAIN (1 << 24)
+      83  
+      84  static double inputs[N_ELEMS];
+
+● Update(orig_perf.c)
+  ⎿  Added 3 lines, removed 1 line
+      88  {
+      89      const char *mode = argc > 1 ? argv[1] : "tp-naive";
+      90  
+      91 +    int repeats = argc > 2 ? atoi(argv[2]) : 200;              
+      92 +                                                               
+      93      if (strcmp(mode, "tp-magic") == 0 || strcmp(mode, "tp-naive
+          ") == 0) {
+      94          for (int i = 0; i < N_ELEMS; i++)
+      95              inputs[i] = random_input();
+      94 -        for (int rep = 0; rep < N_TP_REPEATS; rep++) {         
+      96 +        for (int rep = 0; rep < repeats; rep++) {              
+      97              if (mode[3] == 'm')
+      98                  convert_array_magic(inputs, outputs, N_ELEMS);
+      99              else
+● Update(orig_perf.c)
+  ⎿  Added 1 line
+       5  
+       6  #include <stdint.h>
+       7  #include <stdio.h>
+       8 +#include <stdlib.h>                                            
+       9  #include <string.h>
+      10  
+      11  #define CAIRO_MAGIC_NUMBER_FIXED_16_16 (103079215104.0)
+
+● Now rebuild all variants and run with many more repeats (~5000) to get a clean
+  steady-state frequency reading, comparing tp-naive (heavy vectorization)
+  against tp-magic (scalar, never vectorizes — a built-in control group) on the
+  same binary.
+
+  Ran 4 shell commands (ctrl+o to expand)
+
+● Your memory is correct — but for a different chip than the one I've been 
+  benchmarking on.
+
+  The effect you're recalling was very real and well-documented on Intel's early
+  AVX-512 implementations, starting with Skylake-X/Skylake-SP (~2017). Those
+  chips had multiple "AVX frequency license" levels — L0 (scalar/128-bit), L1
+  (light 256/512-bit), L2 (heavy 512-bit, e.g. FMA) — with progressively lower
+  max turbo clocks, plus a real transition penalty (tens of microseconds, worse
+  on early steppings) when switching license levels. Sustained heavy 512-bit
+  code really could run at a noticeably lower steady-state clock than scalar
+  code on the same core, and mixed scalar/AVX-512 code paid repeated transition
+  costs. It got better with Ice Lake and later Intel generations, and Intel
+  actually fused AVX-512 off entirely on most client chips after Alder Lake
+  because of the heterogeneous P/E-core design — so on client Intel it mostly
+  went from "throttles" to "doesn't exist" for a few generations.
+
+  This machine, though, is an AMD Threadripper PRO 7975WX — Zen4. AMD's Zen4
+  implements AVX-512 by internally splitting every 512-bit instruction into two
+  sequential 256-bit micro-ops on the existing 256-bit datapath
+  ("double-pumping"), specifically so it doesn't need the extra power
+  delivery/voltage domain that caused Intel's downclocking. There's no separate
+  frequency license state at all.
+
+  I checked empirically rather than just citing that: I built three versions of
+  the throughput benchmark (AVX-512, AVX2-only via -mno-avx512f, and SSE2-only
+  baseline via -march=x86-64-v2), ran each under perf stat with a long enough
+  loop (5000 passes over the 1M-element array) that fixed startup cost is
+  negligible, and derived clock speed from cycles / task-clock:
+
+  ┌─────────┬──────────────────┬─────────┬───────────────────────┬─────────┐
+  │  build  │      naive       │ naive   │ magic cycles/element  │ magic   │
+  │         │  cycles/element  │  clock  │       (control)       │  clock  │
+  ├─────────┼──────────────────┼─────────┼───────────────────────┼─────────┤
+  │ AVX-512 │ 0.487            │ 5.00    │ 1.015                 │ 4.97    │
+  │         │                  │ GHz     │                       │ GHz     │
+  ├─────────┼──────────────────┼─────────┼───────────────────────┼─────────┤
+  │ AVX2    │ 0.517            │ 4.95    │ 1.016                 │ 4.94    │
+  │         │                  │ GHz     │                       │ GHz     │
+  ├─────────┼──────────────────┼─────────┼───────────────────────┼─────────┤
+  │ SSE2    │ 0.516            │ 4.88    │ 1.020                 │ 4.95    │
+  │         │                  │ GHz     │                       │ GHz     │
+  └─────────┴──────────────────┴─────────┴───────────────────────┴─────────┘
+
+  magic never vectorizes regardless of target flag, so it's a built-in control —
+  and its clock speed is flat (~4.9-5.0GHz) across all three builds. naive's
+  clock speed is also flat across all three, including the AVX-512 build. No
+  downclock, transient or sustained, is visible here. That matches AMD's stated
+  design goal for Zen4.
+
+  There's a second, more interesting finding buried in that table: AVX-512 only
+  beats AVX2/SSE2 by about 6% (0.487 vs ~0.516 cycles/element), not the ~2x
+  you'd expect from doubling register width — again consistent with
+  double-pumping, since a "512-bit" op is really just two 256-bit ops back to
+  back internally, so it saves on loop/instruction overhead but not on raw
+  execution throughput.
+
+  The practical upshot for your original question: the vectorization advantage
+  that makes naive win doesn't depend on AVX-512 at all. The magic/naive
+  throughput ratio is essentially the same (~2x) at SSE2, AVX2, and AVX-512 —
+  SSE2 alone (present on every x86-64 CPU since 2003) is enough to vectorize the
+  naive multiply-and-truncate and give it the win, since it's the ability to
+  vectorize at all, not the specific width, that the union-based trick
+  forecloses. So even on hardware with no AVX-512, or with an early Skylake-X
+  chip paying the downclock tax you remember, naive's advantage would very
+  likely survive — it just wouldn't get the (small, on this chip) extra boost
+  from wider registers.
+
+✻ Baked for 2m 42s
